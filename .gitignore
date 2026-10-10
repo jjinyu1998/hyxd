@@ -82,3 +82,5 @@ eval_fixtures/
 # Regenerable output of tests/map_score/score_map.py
 tests/map_score/out/
 tests/map_score/__pycache__/
+node_modules/
+bun.lock

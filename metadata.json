@@ -1,0 +1,6 @@
+{
+  "name": "Swarm Rescue Simulator",
+  "description": "Interactive 2D multi-agent autonomous drone swarm rescue and bomb disposal simulator with real-time Lidar, semantic sensors, physics, and red/blue team competition modes.",
+  "permissions": [],
+  "capabilities": []
+}
