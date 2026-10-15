@@ -270,7 +270,8 @@ export class SimulationEngine {
         this.teamMode,
         this.map.disposalCenter,
         inputs,
-        this.drones
+        this.drones,
+        this.controllers
       );
 
       // 竞标成功日志
