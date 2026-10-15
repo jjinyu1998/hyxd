@@ -412,75 +412,72 @@ export class DroneAgentController {
   /**
    * 人工势场法核心计算（加入切向滑墙与防盘旋自适应前向动力）
    */
+  /**
+   * 无旋转漩涡的清晰通道导引 (Clear-Sector Gap-Finder)
+   * 绝不构造切向环绕力，直接在当前激光雷达的开阔扇区中选取最接近目标的航向，彻底杜绝原地打转
+   */
   private steerWithAPF(
     drone: DroneState,
     target: Vector2,
     cmd: CommandsDict,
-    maxForward: number = 0.75,
-    dangerDist: number = 48,
+    maxForward: number = 0.8,
+    _dangerDist: number = 45,
     extraRepulsion?: Vector2
   ) {
     const dx = target.x - drone.position.x;
     const dy = target.y - drone.position.y;
-    const targetDist = Math.sqrt(dx * dx + dy * dy);
-    const attGain = 1.0;
+    let targetAngle = Math.atan2(dy, dx);
 
-    let fx = targetDist > 0 ? (dx / targetDist) * attGain : 0;
-    let fy = targetDist > 0 ? (dy / targetDist) * attGain : 0;
-
-    if (extraRepulsion) {
-      fx += extraRepulsion.x;
-      fy += extraRepulsion.y;
+    // 如果有友军轻微避让力
+    if (extraRepulsion && (extraRepulsion.x !== 0 || extraRepulsion.y !== 0)) {
+      targetAngle = Math.atan2(
+        Math.sin(targetAngle) + extraRepulsion.y,
+        Math.cos(targetAngle) + extraRepulsion.x
+      );
     }
 
-    const repGain = 1200.0;
-    let minObsDist = 999;
-    let frontMinDist = 999;
-
-    let obsRepX = 0;
-    let obsRepY = 0;
+    // 寻找无遮挡且最接近目标的激光射线航向
+    let bestAngle = targetAngle;
+    let minCost = Infinity;
 
     for (const ray of drone.lidarRays) {
-      if (ray.distance < minObsDist) {
-        minObsDist = ray.distance;
-      }
-      if (Math.abs(ray.angle) < Math.PI / 4 && ray.distance < frontMinDist) {
-        frontMinDist = ray.distance;
+      const globalRayAngle = normalizeAngle(drone.angle + ray.angle);
+      const angleDiff = Math.abs(normalizeAngle(globalRayAngle - targetAngle));
+
+      // 评估代价：主要权衡与目标航向的偏差；若距离过近则赋予阻挡惩罚
+      let cost = angleDiff;
+      if (ray.distance < 32) {
+        cost += 50.0 / (ray.distance + 1);
+      } else if (ray.distance < 50) {
+        cost += 5.0 / (ray.distance + 1);
       }
 
-      if (ray.distance < dangerDist) {
-        const rayAngle = normalizeAngle(drone.angle + ray.angle);
-        const repMag = repGain / ((ray.distance + 6) * (ray.distance + 6));
-        obsRepX -= Math.cos(rayAngle) * repMag;
-        obsRepY -= Math.sin(rayAngle) * repMag;
+      if (cost < minCost) {
+        minCost = cost;
+        bestAngle = globalRayAngle;
       }
     }
 
-    // 加入切向分量 (90度旋转)：沿墙面切向滑行，彻底消除死锁震荡
-    const tangentX = -obsRepY * 0.75 * this.tangentSign;
-    const tangentY = obsRepX * 0.75 * this.tangentSign;
+    const headingError = normalizeAngle(bestAngle - drone.angle);
 
-    fx += obsRepX + tangentX;
-    fy += obsRepY + tangentY;
+    // 比例航向转向，无惯性回荡
+    cmd.rotation = Math.max(-1.0, Math.min(1.0, headingError * 1.5));
 
-    const desiredHeading = Math.atan2(fy, fx);
-    const headingError = normalizeAngle(desiredHeading - drone.angle);
+    // 检测正前方是否有超近障碍物 (< 22px)
+    let minFrontDist = 999;
+    for (const ray of drone.lidarRays) {
+      if (Math.abs(ray.angle) < 0.4 && ray.distance < minFrontDist) {
+        minFrontDist = ray.distance;
+      }
+    }
 
-    // 平滑比例偏航
-    cmd.rotation = Math.max(-1.0, Math.min(1.0, headingError * 1.35));
-
-    // 防盘旋：前向速度与角度误差平滑耦合，永不停滞打转
-    const alignment = Math.max(0.35, Math.cos(headingError));
-    let fwdSpeed = maxForward * alignment;
-
-    // 前方紧贴障碍时，智能小幅倒车脱离死角
-    if (frontMinDist < 20) {
-      cmd.forward = -0.35;
-      cmd.rotation = 0.85 * this.tangentSign;
-    } else if (frontMinDist < 35) {
-      cmd.forward = Math.max(0.2, fwdSpeed * 0.5);
+    if (minFrontDist < 20) {
+      cmd.forward = -0.3; // 倒车脱困
+      cmd.rotation = Math.sign(headingError || 1) * 0.8;
     } else {
-      cmd.forward = Math.max(0.35, fwdSpeed);
+      // 永远保持强劲前进动力，平滑转向
+      const forwardFactor = Math.max(0.4, Math.cos(headingError));
+      cmd.forward = maxForward * forwardFactor;
     }
   }
 

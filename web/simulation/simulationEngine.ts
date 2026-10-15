@@ -315,7 +315,7 @@ export class SimulationEngine {
     // 3. Physics & Kinematics Update
     const DT = 0.5;
     const DRAG = 0.92;
-    const ANGULAR_DRAG = 0.85;
+    const ANGULAR_DRAG = 0.50;
     const MAX_SPEED = 4.2;
 
     for (const drone of this.drones) {
@@ -323,8 +323,8 @@ export class SimulationEngine {
 
       const cmd = drone.lastCommand;
 
-      // Angular acceleration
-      drone.angularVelocity = drone.angularVelocity * ANGULAR_DRAG + cmd.rotation * 0.08;
+      // Angular acceleration with responsive damping (prevents overshooting and continuous spinning)
+      drone.angularVelocity = drone.angularVelocity * ANGULAR_DRAG + cmd.rotation * 0.14;
       drone.angle = normalizeAngle(drone.angle + drone.angularVelocity * DT);
 
       // Linear acceleration along drone's local coordinate system

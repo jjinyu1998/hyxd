@@ -502,52 +502,45 @@ class MyDronePhase4(DroneAbstract):
         max_fwd: float,
         extra_rep_vector: Tuple[float, float] = (0.0, 0.0),
     ) -> CommandsDict:
-        att_gain = 1.0
-        fx = math.cos(target_rel_angle) * att_gain + extra_rep_vector[0]
-        fy = math.sin(target_rel_angle) * att_gain + extra_rep_vector[1]
-
         lidar_dists = self.lidar_values()
         lidar_angles = self.lidar_rays_angles()
-        min_dist = 999.0
-        front_min_dist = 999.0
 
-        obs_rep_x = 0.0
-        obs_rep_y = 0.0
+        target_ang = target_rel_angle
+        if extra_rep_vector[0] != 0.0 or extra_rep_vector[1] != 0.0:
+            target_ang = math.atan2(
+                math.sin(target_rel_angle) + extra_rep_vector[1],
+                math.cos(target_rel_angle) + extra_rep_vector[0]
+            )
+
+        best_ang = target_ang
+        min_cost = 99999.0
+        front_d = 999.0
 
         if lidar_dists is not None and lidar_angles is not None:
-            rep_gain = 1200.0
             for dist, ang in zip(lidar_dists, lidar_angles):
                 d = float(dist)
-                if d < min_dist:
-                    min_dist = d
-                if abs(float(ang)) < (math.pi / 4.0) and d < front_min_dist:
-                    front_min_dist = d
-                if d < 48.0:
-                    rep = rep_gain / ((d + 6.0) * (d + 6.0))
-                    obs_rep_x -= math.cos(float(ang)) * rep
-                    obs_rep_y -= math.sin(float(ang)) * rep
+                a = float(ang)
+                if abs(a) < 0.4 and d < front_d:
+                    front_d = d
 
-        tangent_x = -obs_rep_y * 0.75 * self.tangent_sign
-        tangent_y = obs_rep_x * 0.75 * self.tangent_sign
+                diff = abs(normalize_angle(a - target_ang))
+                cost = diff
+                if d < 32.0:
+                    cost += 50.0 / (d + 1.0)
+                elif d < 50.0:
+                    cost += 5.0 / (d + 1.0)
 
-        fx += obs_rep_x + tangent_x
-        fy += obs_rep_y + tangent_y
+                if cost < min_cost:
+                    min_cost = cost
+                    best_ang = a
 
-        desired_ang = math.atan2(fy, fx)
-        heading_err = desired_ang
-        cmd["rotation"] = max(-1.0, min(1.0, heading_err * 1.35))
-
-        alignment = max(0.35, math.cos(heading_err))
-        fwd_speed = max_fwd * alignment
-
-        if front_min_dist < 20.0:
-            cmd["forward"] = -0.35
-            cmd["rotation"] = 0.85 * self.tangent_sign
-        elif front_min_dist < 35.0:
-            cmd["forward"] = max(0.2, fwd_speed * 0.5)
+        cmd["rotation"] = max(-1.0, min(1.0, best_ang * 1.5))
+        if front_d < 20.0:
+            cmd["forward"] = -0.30
+            cmd["rotation"] = 0.80 if best_ang >= 0 else -0.80
         else:
-            cmd["forward"] = max(0.35, fwd_speed)
-
+            fwd_factor = max(0.40, math.cos(best_ang))
+            cmd["forward"] = max_fwd * fwd_factor
         return cmd
 
     def _handle_escape_logic(self, cmd: CommandsDict) -> bool:
