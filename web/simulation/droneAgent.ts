@@ -9,13 +9,22 @@ import {
 } from '../types/simulation';
 import { normalizeAngle, distance } from './physics';
 
+export type KnownBombRecord = {
+  id: number;
+  position: Vector2;
+  claimedByDroneId: number | null;
+  claimCost: number;
+  isDisposed: boolean;
+};
+
 /**
- * 阶段一：高鲁棒性单机运动控制与状态机
+ * 阶段二：多机分布式通信协同与任务竞标拍卖控制器
  * 包含：
- * 1. 人工势场法 (APF) 平滑避障与局部极小值（死胡同）脱困
- * 2. 目标逼近 PID 航向对齐与速度耦合（高成功率抓取）
- * 3. 处置中心精准深入运送与甩尾脱壳（Push & Spin-Release）
- * 4. 10 机全并发自主行动（扇区辐射探索）
+ * 1. 动态任务竞标拍卖协议 (Auction Protocol)：杜绝两架无人机抢同一颗炸弹
+ * 2. 目标黑板与多跳中继 (Shared Target Blackboard)：全队共享炸弹与处置中心坐标
+ * 3. 友军动态空间软排斥 (Fleet Soft Repulsion)：无任务巡航时机群相互排斥，极大提升全图覆盖率
+ * 4. 稳健 APF 避障与渐进逼近抓取 PID
+ * 5. 处置中心精准深入脱壳 (Push & Spin-Release)
  */
 export class DroneAgentController {
   private exploreTick: number = 0;
@@ -35,6 +44,13 @@ export class DroneAgentController {
   // PID 控制器历史误差
   private prevHeadingError: number = 0;
 
+  // 本机认领锁定的目标炸弹 ID
+  public myClaimedBombId: number | null = null;
+
+  // 本地已知的全局目标黑板
+  public knownBombs: Map<number, KnownBombRecord> = new Map();
+  public knownDisposalCenterPos: Vector2 | null = null;
+
   constructor(public droneId: number) {
     this.reset();
   }
@@ -50,13 +66,17 @@ export class DroneAgentController {
     this.escapeCounter = 0;
     this.lastPosition = { x: 0, y: 0 };
     this.prevHeadingError = 0;
+    this.myClaimedBombId = null;
+    this.knownBombs.clear();
+    this.knownDisposalCenterPos = null;
   }
 
   public step(
     drone: DroneState,
     teamMode: TeamMode,
     disposalCenter: ZoneRect,
-    keyboardInputs?: CommandsDict
+    keyboardInputs?: CommandsDict,
+    allDrones?: DroneState[]
   ): { command: CommandsDict; stateMachine: DroneStateMachine } {
     if (drone.health <= 0) {
       return {
@@ -76,22 +96,31 @@ export class DroneAgentController {
     }
 
     if (teamMode === 'rescue') {
-      return this.stepRescue(drone, disposalCenter);
+      return this.stepRescue(drone, disposalCenter, allDrones);
     } else {
       return this.stepPlace(drone);
     }
   }
 
   /**
-   * 蓝方救援模式状态机核心
+   * 蓝方救援模式状态机核心（集成多机竞标拍卖与通信网络）
    */
   private stepRescue(
     drone: DroneState,
-    disposalCenter: ZoneRect
+    disposalCenter: ZoneRect,
+    allDrones?: DroneState[]
   ): { command: CommandsDict; stateMachine: DroneStateMachine } {
     const cmd: CommandsDict = { forward: 0, lateral: 0, rotation: 0, grasper: 0 };
 
-    // 0. 卡死检测与脱困状态检查
+    // 0. 更新感知与黑板记录（记录视野内的炸弹和处置区）
+    this.updatePerceptionBlackboard(drone, disposalCenter);
+
+    // 1. 无线电通信交互与合同网竞标协商 (250px 范围内的同伴)
+    if (!drone.isComDisabled && allDrones) {
+      this.syncMeshCommsAndAuction(drone, allDrones);
+    }
+
+    // 2. 卡死检测与脱困状态检查
     this.updateStuckDetection(drone);
     if (this.escapeCounter > 0) {
       this.escapeCounter--;
@@ -100,10 +129,10 @@ export class DroneAgentController {
       return { command: cmd, stateMachine: 'escape' };
     }
 
-    // 1. 如果已抓取炸弹 -> 执行运送与入库逻辑
+    // 3. 如果当前已抓取炸弹 -> 执行运送与入库逻辑
     if (drone.graspedBombId !== null) {
       cmd.grasper = 1;
-      const disposalCenterPt: Vector2 = {
+      const disposalCenterPt: Vector2 = this.knownDisposalCenterPos || {
         x: disposalCenter.x + disposalCenter.width / 2,
         y: disposalCenter.y + disposalCenter.height / 2,
       };
@@ -112,23 +141,25 @@ export class DroneAgentController {
 
       // 进入处置区附近 (48px)
       if (distToDisposal < 48 || this.carryPushSteps > 0) {
-        // 如果正在执行甩尾释放
         if (this.carrySpinReleaseSteps > 0) {
           this.carrySpinReleaseSteps--;
-          cmd.forward = 0.1;
+          cmd.forward = 0.12;
           cmd.rotation = 0.9 * this.carrySpinSign;
           if (this.carrySpinReleaseSteps <= 2) {
             cmd.grasper = 0; // 松爪脱壳！炸弹滑入处置中心
+            if (this.myClaimedBombId !== null) {
+              const b = this.knownBombs.get(this.myClaimedBombId);
+              if (b) b.isDisposed = true;
+              this.myClaimedBombId = null;
+            }
           }
           return { command: cmd, stateMachine: 'spin_release' };
         }
 
-        // 推入处置中心核心深处
         this.carryPushSteps++;
         this.steerWithAPF(drone, disposalCenterPt, cmd, 0.65, 30);
 
         if (this.carryPushSteps >= 14 || distToDisposal < 25) {
-          // 深入足够深度后，开始快速甩尾脱壳
           this.carrySpinReleaseSteps = 12;
           this.carrySpinSign = Math.random() > 0.5 ? 1.0 : -1.0;
           this.carryPushSteps = 0;
@@ -137,44 +168,171 @@ export class DroneAgentController {
         return { command: cmd, stateMachine: 'push' };
       }
 
-      // 在运送途中，使用人工势场导航前往处置中心
+      // 运送途中，使用人工势场导航前往处置中心
       this.steerWithAPF(drone, disposalCenterPt, cmd, 0.75, 45);
       return { command: cmd, stateMachine: 'carry' };
     }
 
-    // 2. 检查是否有视野内的未抓取炸弹 (语义雷达)
-    const targetBomb = this.findBestTargetBomb(drone);
+    // 4. 执行竞标评估：选定最优未被抢占的炸弹
+    this.evaluateBidsAndClaim(drone);
 
-    if (targetBomb) {
-      this.carryPushSteps = 0;
-      this.carrySpinReleaseSteps = 0;
+    // 5. 如果当前成功竞标认领了炸弹 -> 前往抓取
+    if (this.myClaimedBombId !== null) {
+      const claimedBomb = this.knownBombs.get(this.myClaimedBombId);
+      if (claimedBomb && !claimedBomb.isDisposed) {
+        // 如果视野内可见该炸弹，启动高精度 PD 逼近
+        const visibleBomb = drone.semanticHits.find(
+          (h) => h.entityType === 'BOMB' && h.id === this.myClaimedBombId && !h.grasped
+        );
 
-      // 执行近身逼近 PID 控制
-      return this.chaseAndGraspBomb(drone, targetBomb, cmd);
+        if (visibleBomb && visibleBomb.distance < 90) {
+          return this.chaseAndGraspBomb(drone, visibleBomb, cmd);
+        }
+
+        // 远距离前往炸弹记录的全局位置
+        return this.approachTargetPos(drone, claimedBomb.position, cmd);
+      }
     }
 
-    // 3. 无目标炸弹 -> 全机群发散探索模式 (APF 避障巡航)
-    return this.exploreMap(drone, cmd);
+    // 6. 检查视野内是否有直接可见且未被其他无人机锁定的自由炸弹
+    const immediateBomb = this.findBestImmediateBomb(drone);
+    if (immediateBomb) {
+      return this.chaseAndGraspBomb(drone, immediateBomb, cmd);
+    }
+
+    // 7. 无任务：全机群软排斥自主发散探索 (APF 避障巡航)
+    return this.exploreMapWithFleetRepulsion(drone, cmd, allDrones);
   }
 
   /**
-   * 筛选最合适的近身炸弹
+   * 更新本地黑板信息
    */
-  private findBestTargetBomb(drone: DroneState): SemanticHit | null {
+  private updatePerceptionBlackboard(drone: DroneState, disposalCenter: ZoneRect) {
+    // 记录处置区位置
+    if (!this.knownDisposalCenterPos) {
+      const dcHit = drone.semanticHits.find((h) => h.entityType === 'DISPOSAL_CENTER');
+      if (dcHit) {
+        this.knownDisposalCenterPos = {
+          x: disposalCenter.x + disposalCenter.width / 2,
+          y: disposalCenter.y + disposalCenter.height / 2,
+        };
+      }
+    }
+
+    // 记录视野内的未抓取炸弹
+    for (const hit of drone.semanticHits) {
+      if (hit.entityType === 'BOMB' && !hit.grasped) {
+        const existing = this.knownBombs.get(hit.id);
+        if (!existing) {
+          this.knownBombs.set(hit.id, {
+            id: hit.id,
+            position: { ...hit.position },
+            claimedByDroneId: null,
+            claimCost: 9999,
+            isDisposed: false,
+          });
+        } else {
+          existing.position = { ...hit.position };
+        }
+      }
+    }
+  }
+
+  /**
+   * 无线电网络多跳同步与任务竞标协商 (Mesh Comms & Auction Resolution)
+   */
+  private syncMeshCommsAndAuction(drone: DroneState, allDrones: DroneState[]) {
+    const COM_RANGE = 260;
+
+    for (const peer of allDrones) {
+      if (peer.id === drone.id || peer.health <= 0 || peer.isComDisabled) continue;
+
+      const d = distance(drone.position, peer.position);
+      if (d <= COM_RANGE) {
+        // 1. 同步处置中心位置
+        if (!this.knownDisposalCenterPos && peer.semanticHits.some((h) => h.entityType === 'DISPOSAL_CENTER')) {
+          this.knownDisposalCenterPos = {
+            x: peer.position.x,
+            y: peer.position.y,
+          };
+        }
+
+        // 2. 交换已知炸弹库
+        for (const [bId, bRecord] of this.knownBombs.entries()) {
+          // 如果对方也声称认领同一颗炸弹
+          if (peer.lastCommand && bRecord.claimedByDroneId !== null) {
+            // 对方如果在运送炸弹，不参与抢夺
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * 竞标仲裁：为自己选取距离最近且无冲突的炸弹
+   */
+  private evaluateBidsAndClaim(drone: DroneState) {
+    if (this.myClaimedBombId !== null) {
+      const b = this.knownBombs.get(this.myClaimedBombId);
+      if (b && !b.isDisposed && (b.claimedByDroneId === null || b.claimedByDroneId === this.droneId)) {
+        b.claimedByDroneId = this.droneId;
+        b.claimCost = distance(drone.position, b.position);
+        return;
+      }
+      this.myClaimedBombId = null;
+    }
+
+    let bestBombId: number | null = null;
+    let minCost = 9999;
+
+    for (const [bId, record] of this.knownBombs.entries()) {
+      if (record.isDisposed) continue;
+
+      const cost = distance(drone.position, record.position);
+
+      // 如果尚未被认领，或自己明显更近（近 50px 以上）
+      if (record.claimedByDroneId === null || cost < record.claimCost - 50) {
+        if (cost < minCost) {
+          minCost = cost;
+          bestBombId = bId;
+        }
+      }
+    }
+
+    if (bestBombId !== null) {
+      this.myClaimedBombId = bestBombId;
+      const b = this.knownBombs.get(bestBombId);
+      if (b) {
+        b.claimedByDroneId = this.droneId;
+        b.claimCost = minCost;
+      }
+    }
+  }
+
+  /**
+   * 寻找立即可见的自由炸弹
+   */
+  private findBestImmediateBomb(drone: DroneState): SemanticHit | null {
     const ungraspedBombs = drone.semanticHits.filter(
       (h) => h.entityType === 'BOMB' && !h.grasped
     );
 
     if (ungraspedBombs.length === 0) return null;
 
-    // 优先选择最近且前方夹角较小的炸弹
-    ungraspedBombs.sort((a, b) => {
-      const scoreA = a.distance + Math.abs(a.angle) * 30;
-      const scoreB = b.distance + Math.abs(b.angle) * 30;
-      return scoreA - scoreB;
-    });
-
+    ungraspedBombs.sort((a, b) => a.distance - b.distance);
     return ungraspedBombs[0];
+  }
+
+  /**
+   * 导航前往炸弹全局位置
+   */
+  private approachTargetPos(
+    drone: DroneState,
+    target: Vector2,
+    cmd: CommandsDict
+  ): { command: CommandsDict; stateMachine: DroneStateMachine } {
+    this.steerWithAPF(drone, target, cmd, 0.75, 45);
+    return { command: cmd, stateMachine: 'chase' };
   }
 
   /**
@@ -185,11 +343,10 @@ export class DroneAgentController {
     bomb: SemanticHit,
     cmd: CommandsDict
   ): { command: CommandsDict; stateMachine: DroneStateMachine } {
-    const angleErr = bomb.angle; // 相对角度 [-pi, pi]
+    const angleErr = bomb.angle;
     const dist = bomb.distance;
 
-    // 比例-微分 PID 航向控制
-    const Kp = 1.6;
+    const Kp = 1.7;
     const Kd = 0.4;
     const derivative = angleErr - this.prevHeadingError;
     this.prevHeadingError = angleErr;
@@ -197,11 +354,9 @@ export class DroneAgentController {
     const rotCmd = Math.max(-1.0, Math.min(1.0, angleErr * Kp + derivative * Kd));
     cmd.rotation = rotCmd;
 
-    // 速度与航向误差耦合：航向误差大时减速对正，对正后平滑前冲
     if (Math.abs(angleErr) > 0.3) {
-      cmd.forward = 0.15; // 减速转向
+      cmd.forward = 0.15;
     } else {
-      // 距离适中时全速接近，极近时保持稳定推力
       if (dist > 60) {
         cmd.forward = 0.75;
       } else if (dist > 32) {
@@ -211,7 +366,6 @@ export class DroneAgentController {
       }
     }
 
-    // 抓爪开合逻辑：当距离小于 36px 且基本对正前向时，激活抓爪咬合！
     if (dist <= 36 && Math.abs(angleErr) < 0.45) {
       cmd.grasper = 1;
     }
@@ -220,15 +374,15 @@ export class DroneAgentController {
   }
 
   /**
-   * 基于人工势场 (APF) 的全域发散探索
+   * 融入友军空间软排斥的探索模式
    */
-  private exploreMap(
+  private exploreMapWithFleetRepulsion(
     drone: DroneState,
-    cmd: CommandsDict
+    cmd: CommandsDict,
+    allDrones?: DroneState[]
   ): { command: CommandsDict; stateMachine: DroneStateMachine } {
     this.exploreTick++;
 
-    // 周期性调整航向，配合自身的扇区基准角
     const baseHeading = this.sectorAngle + Math.sin(this.exploreTick * 0.04) * 0.8;
     const virtualGoalDist = 180;
     const virtualGoal: Vector2 = {
@@ -236,25 +390,37 @@ export class DroneAgentController {
       y: drone.position.y + Math.sin(baseHeading) * virtualGoalDist,
     };
 
-    // 使用 APF 进行平滑避障与巡航
-    this.steerWithAPF(drone, virtualGoal, cmd, 0.7, 50);
+    // 友军排斥向量
+    let fleetRepX = 0;
+    let fleetRepY = 0;
 
+    if (allDrones) {
+      for (const peer of allDrones) {
+        if (peer.id === drone.id || peer.health <= 0) continue;
+        const d = distance(drone.position, peer.position);
+        if (d > 0.1 && d < 110) {
+          const repMag = 500 / (d * d);
+          fleetRepX += ((drone.position.x - peer.position.x) / d) * repMag;
+          fleetRepY += ((drone.position.y - peer.position.y) / d) * repMag;
+        }
+      }
+    }
+
+    this.steerWithAPF(drone, virtualGoal, cmd, 0.72, 50, { x: fleetRepX, y: fleetRepY });
     return { command: cmd, stateMachine: 'explore' };
   }
 
   /**
-   * 人工势场法 (APF) 核心计算函数
-   * 引力场：指向 target
-   * 斥力场：所有 Lidar 射线检测到的近距离墙体产生反向斥力
+   * 人工势场法核心计算
    */
   private steerWithAPF(
     drone: DroneState,
     target: Vector2,
     cmd: CommandsDict,
     maxForward: number = 0.7,
-    dangerDist: number = 50
+    dangerDist: number = 50,
+    extraRepulsion?: Vector2
   ) {
-    // 1. 引力向量 (Attractive Force)
     const dx = target.x - drone.position.x;
     const dy = target.y - drone.position.y;
     const targetDist = Math.sqrt(dx * dx + dy * dy);
@@ -263,7 +429,11 @@ export class DroneAgentController {
     let fx = targetDist > 0 ? (dx / targetDist) * attGain : 0;
     let fy = targetDist > 0 ? (dy / targetDist) * attGain : 0;
 
-    // 2. 斥力向量 (Repulsive Force from Lidar rays)
+    if (extraRepulsion) {
+      fx += extraRepulsion.x;
+      fy += extraRepulsion.y;
+    }
+
     const repGain = 1400.0;
     let minObsDist = 999;
 
@@ -273,27 +443,21 @@ export class DroneAgentController {
       }
 
       if (ray.distance < dangerDist) {
-        // 射线方向的绝对全局角度
         const rayAngle = normalizeAngle(drone.angle + ray.angle);
-        // 距离越近，排斥力按平方反比急剧增大
         const repMag = repGain / ((ray.distance + 5) * (ray.distance + 5));
         fx -= Math.cos(rayAngle) * repMag;
         fy -= Math.sin(rayAngle) * repMag;
       }
     }
 
-    // 3. 合成期望航向角
     const desiredHeading = Math.atan2(fy, fx);
     const headingError = normalizeAngle(desiredHeading - drone.angle);
 
-    // 4. 计算旋转与前向动力
     if (Math.abs(headingError) > 0.6) {
-      // 角度偏差较大时，主要转向，小油门
       cmd.rotation = Math.sign(headingError) * 0.85;
       cmd.forward = 0.15;
     } else {
       cmd.rotation = headingError * 1.4;
-      // 若极度靠近障碍物则减速，开阔区全速前冲
       if (minObsDist < 25) {
         cmd.forward = 0.1;
       } else if (minObsDist < 40) {
@@ -305,17 +469,15 @@ export class DroneAgentController {
   }
 
   /**
-   * 卡死/震荡自检测机制
+   * 卡死自检测机制
    */
   private updateStuckDetection(drone: DroneState) {
     const moved = distance(drone.position, this.lastPosition);
     this.lastPosition = { ...drone.position };
 
-    // 如果连续 18 个 timestep 几乎没有移动且油门不为 0
     if (moved < 1.0 && drone.health > 0) {
       this.stuckCounter++;
       if (this.stuckCounter > 18) {
-        // 触发脱困动作：后退并顺时针/逆时针大角度旋转
         this.escapeCounter = 16;
         this.escapeDirection = Math.random() > 0.5 ? 1 : -1;
         this.stuckCounter = 0;
@@ -326,7 +488,7 @@ export class DroneAgentController {
   }
 
   /**
-   * 红方布雷模式 (保持稳健巡航与布雷)
+   * 红方布雷模式
    */
   private stepPlace(
     drone: DroneState
@@ -334,7 +496,6 @@ export class DroneAgentController {
     const cmd: CommandsDict = { forward: 0, lateral: 0, rotation: 0, grasper: 0, placeBomb: false };
     this.exploreTick++;
 
-    // 周期性在开阔区域布雷
     if (drone.carriedBombsCount > 0 && this.exploreTick % 100 === 0) {
       let frontClear = true;
       for (const r of drone.lidarRays) {

@@ -264,12 +264,25 @@ export class SimulationEngine {
       const controller = this.controllers[i];
 
       const inputs = drone.id === this.selectedDroneId ? this.manualInputs : undefined;
+      const prevClaim = controller.myClaimedBombId;
       const { command, stateMachine } = controller.step(
         drone,
         this.teamMode,
         this.map.disposalCenter,
-        inputs
+        inputs,
+        this.drones
       );
+
+      // 竞标成功日志
+      if (controller.myClaimedBombId !== null && controller.myClaimedBombId !== prevClaim) {
+        this.addMessage({
+          senderId: drone.id,
+          timestep: this.timestep,
+          text: `🤝 竞标认领成功：Drone #${drone.id} 赢得 Bomb #${controller.myClaimedBombId}，全速前往抓取！`,
+          type: 'info',
+          position: drone.position,
+        });
+      }
 
       drone.lastCommand = command;
       drone.stateMachine = stateMachine;

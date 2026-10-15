@@ -170,6 +170,12 @@ export const TelemetryPanel: React.FC<TelemetryPanelProps> = ({
                   : `${(drone.speed * 10).toFixed(1)} px/s`}
               </span>
             </div>
+            <div className="col-span-2 pt-1 border-t border-slate-800/40 flex justify-between items-center text-[10px]">
+              <span className="text-slate-400">AUCTION CLAIM:</span>
+              <span className="text-amber-300 font-bold">
+                {drone.stateMachine === 'chase' ? '🎯 LOCKED TARGET' : drone.stateMachine === 'carry' ? '📦 DELIVERING' : '🧭 SECTOR PATROL'}
+              </span>
+            </div>
           </div>
         </div>
 
