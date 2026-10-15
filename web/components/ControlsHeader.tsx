@@ -100,8 +100,8 @@ export const ControlsHeader: React.FC<ControlsHeaderProps> = ({
           >
             <ShieldAlert className="w-3.5 h-3.5 text-blue-300" />
             <span>Blue (Rescue)</span>
-            <span className="text-[9px] bg-emerald-950/80 text-emerald-300 px-1 py-0.2 rounded border border-emerald-400/40">
-              P2-Auction
+            <span className="text-[9px] bg-purple-950/80 text-purple-300 px-1 py-0.2 rounded border border-purple-400/40">
+              P4-Hybrid
             </span>
           </button>
           <button

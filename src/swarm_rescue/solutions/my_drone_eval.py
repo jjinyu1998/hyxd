@@ -4,7 +4,7 @@ Submission entrypoint helpers used by the launcher.
 
 from swarm_rescue.simulation.reporting.team_mode import TeamMode
 from swarm_rescue.solutions.my_drone_place_example import MyDronePlaceExample
-from swarm_rescue.solutions.my_drone_phase2 import MyDronePhase2
+from swarm_rescue.solutions.my_drone_phase4 import MyDronePhase4
 
 
 def drone_class_for_mode(mode: str):
@@ -14,4 +14,4 @@ def drone_class_for_mode(mode: str):
     team_mode = TeamMode.from_string(mode)
     if team_mode == TeamMode.PLACE:
         return MyDronePlaceExample
-    return MyDronePhase2
+    return MyDronePhase4

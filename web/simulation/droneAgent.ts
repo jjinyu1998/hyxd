@@ -17,18 +17,18 @@ export type KnownBombRecord = {
   isDisposed: boolean;
 };
 
-// 全图 10 大战略探索路点（覆盖地图各个不同的大厅、房间与走廊）
+// 全图 10 大战略探索路点（精确穿过门洞，覆盖各个房间，绝不撞隔墙死锁）
 const EXPLORATION_WAYPOINTS: Vector2[] = [
-  { x: 750, y: 150 }, // 0: 东北房间
-  { x: 450, y: 180 }, // 1: 北部主走廊
-  { x: 850, y: 400 }, // 2: 远东房间
-  { x: 800, y: 650 }, // 3: 东南大厅
-  { x: 500, y: 650 }, // 4: 南部房间
-  { x: 220, y: 650 }, // 5: 西南大厅
-  { x: 480, y: 400 }, // 6: 地图中庭核心
-  { x: 250, y: 380 }, // 7: 西部走廊
-  { x: 650, y: 520 }, // 8: 东南过渡区
-  { x: 380, y: 250 }, // 9: 西北主出入口
+  { x: 380, y: 350 }, // 0: 出生区前方主走廊
+  { x: 420, y: 600 }, // 1: 穿向中央大厅的南门
+  { x: 650, y: 620 }, // 2: 东南大厅
+  { x: 720, y: 350 }, // 3: 中央大厅东侧
+  { x: 800, y: 160 }, // 4: 通往远东走廊的北门前
+  { x: 1050, y: 150 }, // 5: 穿过北门进入东北房间
+  { x: 1080, y: 550 }, // 6: 东南远端房间
+  { x: 700, y: 550 }, // 7: 中央南部
+  { x: 350, y: 600 }, // 8: 西南大厅
+  { x: 250, y: 400 }, // 9: 回到西北通道
 ];
 
 /**
@@ -382,7 +382,12 @@ export class DroneAgentController {
       this.waypointIndex = (this.waypointIndex + 3) % EXPLORATION_WAYPOINTS.length;
     }
 
-    const targetPos = EXPLORATION_WAYPOINTS[this.waypointIndex];
+    let targetPos = EXPLORATION_WAYPOINTS[this.waypointIndex];
+
+    // 如果仍在出生区狭小房间 (x < 300, y < 420)，优先引导冲出房门
+    if (drone.position.x < 300 && drone.position.y < 420) {
+      targetPos = { x: 400, y: 350 };
+    }
 
     // 计算轻度友军疏散排斥（仅在中等距离生效，避免起点爆炸）
     let fleetRepX = 0;
