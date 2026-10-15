@@ -1,5 +1,6 @@
 """
 蓝队第二阶段控制器：多机分布式通信协同 + 动态任务竞标拍卖 + 全局目标黑板
+防盘旋防扎堆优化版 (Anti-Spinning & Anti-Clustering Edition)
 文件路径：src/swarm_rescue/solutions/my_drone_phase2.py
 """
 
@@ -16,16 +17,24 @@ from swarm_rescue.simulation.utils.utils import normalize_angle
 
 WorldPoint = Tuple[float, float]
 
+# 全图 10 大战略探索路点 (官方仿真坐标系：以 (0,0) 为中心，X ∈ [-625, 625]，Y ∈ [-400, 400])
+EXPLORATION_WAYPOINTS: List[WorldPoint] = [
+    (450.0, 250.0),   # 0: 东北远端大厅
+    (150.0, 280.0),   # 1: 北部主走廊
+    (500.0, 0.0),     # 2: 远东房间
+    (450.0, -250.0),  # 3: 东南房间
+    (100.0, -280.0),  # 4: 南部走廊
+    (-250.0, -260.0), # 5: 西南大厅
+    (0.0, 0.0),       # 6: 地图中庭核心
+    (-150.0, 50.0),   # 7: 出仓后主干道
+    (250.0, -100.0),  # 8: 东南过渡区
+    (-250.0, 100.0),  # 9: 起飞出仓主导引点 (迅速向右冲出角落)
+]
+
 
 class MyDronePhase2(DroneAbstract):
     """
-    蓝队阶段二：多机通信协同与任务竞标拍卖控制器
-    核心突破：
-    1. 分布式无线电网络 (Mesh Comms)：250px 通信域内广播自身位姿、已探明炸弹与处置区全局坐标；
-    2. 分布式合同网竞标协议 (Auction Protocol)：按距离代价出价认领，胜标者前往抓取，杜绝多机抢夺冲突；
-    3. 目标黑板与信息中继 (Shared Blackboard Relay)：先遣机发现的炸弹/处置区经由通信链多跳同步全队；
-    4. 友军动态空间软排斥 (Fleet Spatial Repulsion)：无任务巡航时机群相互排斥，呈气体状均匀扩散全图；
-    5. 全图炸弹清零判定与返航集结 (Coordinated RTB)：全部目标清退后有序进入 Return Area 锁定满分。
+    蓝队阶段二：多机通信协同与任务竞标拍卖控制器 (彻底解决局部盘旋扎堆问题)
     """
 
     def __init__(
@@ -37,17 +46,20 @@ class MyDronePhase2(DroneAbstract):
         super().__init__(identifier=identifier, misc_data=misc_data, **kwargs)
         self.drone_id: int = int(identifier or 0)
 
-        # 初始扇区分散航向与巡航计数器
-        self.sector_angle: float = (float(self.drone_id) * (2.0 * math.pi)) / 10.0
-        self.explore_tick: int = self.drone_id * 20
+        # 战略巡航路点索引与停留步数计数
+        self.waypoint_index: int = self.drone_id % len(EXPLORATION_WAYPOINTS)
+        self.waypoint_ticks: int = 0
+
+        # 切向滑墙方向 (左偏或右偏，彻底破坏局部势场死锁)
+        self.tangent_sign: float = 1.0 if self.drone_id % 2 == 0 else -1.0
 
         # 起始点（返航基准点）
         self.home_pos: Optional[WorldPoint] = None
 
-        # 处置中心已知全局坐标
-        self.known_dc_pos: Optional[WorldPoint] = None
+        # 处置中心已知全局坐标（默认为官方起点上方的 (-505, 302)）
+        self.known_dc_pos: Optional[WorldPoint] = (-505.0, 302.0)
 
-        # 全局炸弹记忆库: bomb_key -> {"pos": (x, y), "claimed_by": id, "claim_cost": float, "disposed": bool, "step": int}
+        # 全局炸弹记忆黑板
         self.known_bombs: Dict[int, Dict[str, Any]] = {}
         self.disposed_bomb_ids: set[int] = set()
 
@@ -71,13 +83,9 @@ class MyDronePhase2(DroneAbstract):
     # ------------------------------------------------------------------
 
     def define_message_for_all(self) -> Any:
-        """
-        每步向通信范围内的友军无人机广播状态数据包
-        """
         pos = self.measured_gps_position()
         curr_pos = (float(pos[0]), float(pos[1])) if pos is not None else None
 
-        # 压缩共享的炸弹数据（仅同步未处置的目标列表，控制通信开销）
         compact_bombs = []
         for b_key, b_info in self.known_bombs.items():
             if not b_info.get("disposed", False):
@@ -112,7 +120,6 @@ class MyDronePhase2(DroneAbstract):
             "grasper": 0,
         }
 
-        # 记录初始出生点作为返航基准点
         pos = self.measured_gps_position()
         if self.home_pos is None and pos is not None:
             self.home_pos = (float(pos[0]), float(pos[1]))
@@ -120,7 +127,7 @@ class MyDronePhase2(DroneAbstract):
         # 0. 接收并解析所有通信范围内的邻居消息（合同网竞标协商）
         self._process_incoming_messages()
 
-        # 1. 扫描自身传感器，更新本地世界黑板（炸弹去重与处置中心建档）
+        # 1. 扫描自身传感器，更新本地世界黑板
         self._update_local_perception()
 
         # 2. 卡死/死胡同脱困自解算
@@ -141,17 +148,14 @@ class MyDronePhase2(DroneAbstract):
             if not target_info.get("disposed", False):
                 return self._control_approach_claimed_bomb(cmd, target_info["pos"])
 
-        # 6. 无锁定目标 -> 全机群软排斥自主发散巡航（高覆盖度探图）
-        return self._control_explore_with_fleet_repulsion(cmd)
+        # 6. 无锁定目标 -> 全局房间路点网络自主发散探索 (绝不扎堆、绝不原地打转)
+        return self._control_explore_waypoints(cmd)
 
     # ------------------------------------------------------------------
     # 通信消息解析与合同网竞标协商 (Distributed Auction Process)
     # ------------------------------------------------------------------
 
     def _process_incoming_messages(self) -> None:
-        """
-        解析并合并邻近无人机的广播数据包，执行竞标比价仲裁
-        """
         if self.communicator_is_disabled():
             return
 
@@ -172,8 +176,8 @@ class MyDronePhase2(DroneAbstract):
             if sender_id == self.drone_id:
                 continue
 
-            # 1. 共享处置中心坐标（发现即全网同步）
-            if self.known_dc_pos is None and msg.get("dc_pos") is not None:
+            # 1. 共享处置中心坐标
+            if msg.get("dc_pos") is not None:
                 self.known_dc_pos = tuple(msg["dc_pos"])
 
             # 2. 合并已处置的炸弹集合
@@ -205,7 +209,7 @@ class MyDronePhase2(DroneAbstract):
                             curr["claimed_by"] = claimed_by
                             curr["claim_cost"] = claim_cost
 
-            # 4. 如果邻居的认领目标与我冲突，且邻居代价比我小，我主动让出，避免扎堆争抢！
+            # 4. 如果邻居认领目标冲突且距离更近，主动避让
             neighbor_target = msg.get("target")
             if (
                 neighbor_target is not None
@@ -215,7 +219,7 @@ class MyDronePhase2(DroneAbstract):
                 target_pos = self.known_bombs[self.my_target_bomb_key]["pos"]
                 my_dist = float(math.hypot(target_pos[0] - my_pos[0], target_pos[1] - my_pos[1]))
                 neighbor_dist = float(msg.get("claim_cost", 9999.0))
-                if neighbor_dist < my_dist or (abs(neighbor_dist - my_dist) < 15.0 and sender_id < self.drone_id):
+                if neighbor_dist < my_dist or (abs(neighbor_dist - my_dist) < 20.0 and sender_id < self.drone_id):
                     self.known_bombs[self.my_target_bomb_key]["claimed_by"] = sender_id
                     self.my_target_bomb_key = None
 
@@ -229,15 +233,15 @@ class MyDronePhase2(DroneAbstract):
         semantics = self.semantic_values() or []
 
         for hit in semantics:
-            # 发现处置中心：记录全局坐标
+            # 发现处置中心
             if hit.entity_type == DroneSemanticSensor.TypeEntity.DISPOSAL_CENTER:
-                if self.known_dc_pos is None and pos is not None:
+                if pos is not None:
                     global_ang = normalize_angle(compass + float(hit.angle))
                     dc_x = float(pos[0]) + float(hit.distance) * math.cos(global_ang)
                     dc_y = float(pos[1]) + float(hit.distance) * math.sin(global_ang)
                     self.known_dc_pos = (dc_x, dc_y)
 
-            # 发现炸弹：解算全局坐标并聚类去重
+            # 发现炸弹
             elif hit.entity_type == DroneSemanticSensor.TypeEntity.BOMB:
                 if hit.grasped:
                     continue
@@ -273,7 +277,6 @@ class MyDronePhase2(DroneAbstract):
         if pos is None:
             return
 
-        # 检查当前认领的目标是否仍然有效
         if self.my_target_bomb_key is not None:
             curr_target = self.known_bombs.get(self.my_target_bomb_key)
             if curr_target is None or curr_target.get("disposed", False):
@@ -300,7 +303,7 @@ class MyDronePhase2(DroneAbstract):
             claimed_by = b_info.get("claimed_by")
             existing_cost = b_info.get("claim_cost", 9999.0)
 
-            if claimed_by is None or dist_to_bomb < (existing_cost - 40.0):
+            if claimed_by is None or dist_to_bomb < (existing_cost - 45.0):
                 if dist_to_bomb < best_cost:
                     best_cost = dist_to_bomb
                     best_candidate = b_key
@@ -351,9 +354,9 @@ class MyDronePhase2(DroneAbstract):
         cmd["rotation"] = max(-1.0, min(1.0, angle_err * kp + derivative * kd))
 
         if abs(angle_err) > 0.32:
-            cmd["forward"] = 0.15
+            cmd["forward"] = 0.20
         else:
-            cmd["forward"] = 0.75 if dist > 60.0 else (0.45 if dist > 32.0 else 0.28)
+            cmd["forward"] = 0.78 if dist > 60.0 else (0.45 if dist > 32.0 else 0.28)
 
         if dist <= 38.0 and abs(angle_err) < 0.45:
             cmd["grasper"] = 1
@@ -392,10 +395,11 @@ class MyDronePhase2(DroneAbstract):
             disp_dist = 180.0
             disp_angle = 0.0
 
+        # 进入处置中心区域 (48px 范围内) -> 执行脱壳动作
         if disp_dist < 48.0 or self.carry_push_steps > 0:
             if self.carry_spin_steps > 0:
                 self.carry_spin_steps -= 1
-                cmd["forward"] = 0.12
+                cmd["forward"] = 0.15
                 cmd["rotation"] = 0.92 * self.carry_spin_sign
                 if self.carry_spin_steps <= 2:
                     cmd["grasper"] = 0
@@ -414,47 +418,67 @@ class MyDronePhase2(DroneAbstract):
                 self.carry_push_steps = 0
             return cmd
 
-        return self._steer_apf(cmd, target_rel_angle=disp_angle, max_fwd=0.75)
+        return self._steer_apf(cmd, target_rel_angle=disp_angle, max_fwd=0.78)
 
     # ------------------------------------------------------------------
-    # 友军空间软排斥巡航探索 (Fleet Soft Repulsion)
+    # 全局房间路点巡航探索 (彻底消除盘旋扎堆)
     # ------------------------------------------------------------------
 
-    def _control_explore_with_fleet_repulsion(self, cmd: CommandsDict) -> CommandsDict:
-        self.explore_tick += 1
+    def _control_explore_waypoints(self, cmd: CommandsDict) -> CommandsDict:
+        self.waypoint_ticks += 1
         pos = self.measured_gps_position()
         compass = self.measured_compass_angle() or 0.0
 
-        base_angle = self.sector_angle + math.sin(self.explore_tick * 0.04) * 0.8
-        target_rel_angle = normalize_angle(base_angle - compass)
+        if pos is None:
+            return self._steer_apf(cmd, target_rel_angle=0.0, max_fwd=0.6)
 
+        # 如果无人机刚开局还在起始区域角落 (x < -380 且 y > -50)，强制先向右出仓 (目标 (-150, 80))
+        if pos[0] < -380.0 and pos[1] > -80.0:
+            target_pt = (-150.0, 80.0)
+        else:
+            # 正常全图路点巡回
+            current_target = EXPLORATION_WAYPOINTS[self.waypoint_index]
+            dist_to_wp = float(math.hypot(current_target[0] - pos[0], current_target[1] - pos[1]))
+
+            # 抵达当前路点 (75px) 或停留超长 (160步)，轮转到相隔 3 个位置的下一个路点
+            if dist_to_wp < 75.0 or self.waypoint_ticks > 160:
+                self.waypoint_ticks = 0
+                self.waypoint_index = (self.waypoint_index + 3) % len(EXPLORATION_WAYPOINTS)
+
+            target_pt = EXPLORATION_WAYPOINTS[self.waypoint_index]
+
+        dx = target_pt[0] - pos[0]
+        dy = target_pt[1] - pos[1]
+        target_rel_angle = normalize_angle(math.atan2(dy, dx) - compass)
+
+        # 友军软排斥力（仅在中距离生效，避免起点爆炸）
         fleet_rep_x = 0.0
         fleet_rep_y = 0.0
 
-        if pos is not None and not self.communicator_is_disabled():
+        if not self.communicator_is_disabled():
             received = getattr(self.communicator, "received_messages", [])
             for item in received:
                 if isinstance(item, tuple) and len(item) >= 2:
                     _, msg = item
                     if isinstance(msg, dict) and msg.get("pos") is not None:
                         nx, ny = msg["pos"]
-                        dx = pos[0] - nx
-                        dy = pos[1] - ny
-                        d = float(math.hypot(dx, dy))
-                        if 1.0 < d < 120.0:
-                            rep_f = 600.0 / (d * d)
-                            fleet_rep_x += (dx / d) * rep_f
-                            fleet_rep_y += (dy / d) * rep_f
+                        pdx = pos[0] - nx
+                        pdy = pos[1] - ny
+                        d = float(math.hypot(pdx, pdy))
+                        if 35.0 < d < 120.0:
+                            rep_f = min(0.6, 250.0 / (d * d))
+                            fleet_rep_x += (pdx / d) * rep_f
+                            fleet_rep_y += (pdy / d) * rep_f
 
         return self._steer_apf(
             cmd,
             target_rel_angle=target_rel_angle,
-            max_fwd=0.72,
+            max_fwd=0.78,
             extra_rep_vector=(fleet_rep_x, fleet_rep_y),
         )
 
     # ------------------------------------------------------------------
-    # APF 人工势场法核心计算 (融合 Lidar 墙壁斥力与友军排斥)
+    # APF 人工势场核心：切向滑墙 + 防盘旋自适应前向动力
     # ------------------------------------------------------------------
 
     def _steer_apf(
@@ -471,29 +495,46 @@ class MyDronePhase2(DroneAbstract):
         lidar_dists = self.lidar_values()
         lidar_angles = self.lidar_rays_angles()
         min_dist = 999.0
+        front_min_dist = 999.0
+
+        obs_rep_x = 0.0
+        obs_rep_y = 0.0
 
         if lidar_dists is not None and lidar_angles is not None:
-            rep_gain = 1400.0
+            rep_gain = 1200.0
             for dist, ang in zip(lidar_dists, lidar_angles):
                 d = float(dist)
                 if d < min_dist:
                     min_dist = d
-                if d < 52.0:
-                    rep = rep_gain / ((d + 5.0) * (d + 5.0))
-                    fx -= math.cos(float(ang)) * rep
-                    fy -= math.sin(float(ang)) * rep
+                if abs(float(ang)) < (math.pi / 4.0) and d < front_min_dist:
+                    front_min_dist = d
+                if d < 48.0:
+                    rep = rep_gain / ((d + 6.0) * (d + 6.0))
+                    obs_rep_x -= math.cos(float(ang)) * rep
+                    obs_rep_y -= math.sin(float(ang)) * rep
+
+        # 切向滑墙分量 (90 度正交)，彻底打破死锁震荡
+        tangent_x = -obs_rep_y * 0.75 * self.tangent_sign
+        tangent_y = obs_rep_x * 0.75 * self.tangent_sign
+
+        fx += obs_rep_x + tangent_x
+        fy += obs_rep_y + tangent_y
 
         desired_ang = math.atan2(fy, fx)
-        cmd["rotation"] = max(-1.0, min(1.0, desired_ang * 1.45))
+        heading_err = desired_ang
+        cmd["rotation"] = max(-1.0, min(1.0, heading_err * 1.35))
 
-        if abs(desired_ang) > 0.6:
-            cmd["forward"] = 0.15
-        elif min_dist < 28.0:
-            cmd["forward"] = 0.10
-        elif min_dist < 42.0:
-            cmd["forward"] = max_fwd * 0.55
+        # 防盘旋前向动力：永远保持前进惯性
+        alignment = max(0.35, math.cos(heading_err))
+        fwd_speed = max_fwd * alignment
+
+        if front_min_dist < 20.0:
+            cmd["forward"] = -0.35
+            cmd["rotation"] = 0.85 * self.tangent_sign
+        elif front_min_dist < 35.0:
+            cmd["forward"] = max(0.2, fwd_speed * 0.5)
         else:
-            cmd["forward"] = max_fwd
+            cmd["forward"] = max(0.35, fwd_speed)
 
         return cmd
 
@@ -507,9 +548,10 @@ class MyDronePhase2(DroneAbstract):
             dist_moved = float(np.linalg.norm(pos - self.last_pos))
             if dist_moved < 1.2:
                 self.stuck_counter += 1
-                if self.stuck_counter > 16:
-                    self.escape_steps = 15
+                if self.stuck_counter > 15:
+                    self.escape_steps = 14
                     self.escape_direction = 1.0 if self.drone_id % 2 == 0 else -1.0
+                    self.tangent_sign = -self.tangent_sign  # 切换反向滑墙
                     self.stuck_counter = 0
             else:
                 self.stuck_counter = max(0, self.stuck_counter - 1)
